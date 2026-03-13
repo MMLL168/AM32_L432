@@ -305,6 +305,18 @@
 #define DRONECAN_SUPPORT 1
 #endif
 
+#ifdef  NUCLEO_L432KC_L431
+#define FILE_NAME               "NUCLEO_L432KC_L431"
+#define FIRMWARE_NAME           "L432KC"
+#define DEAD_TIME               80
+#define HARDWARE_GROUP_L4_A
+#define COMP_ORDER_L4_A_045
+#define TARGET_VOLTAGE_DIVIDER  260
+#define USE_SERIAL_TELEMETRY
+#define RAMP_SPEED_LOW_RPM      1
+#define RAMP_SPEED_HIGH_RPM     1
+#endif
+
 #ifdef SEQURE_4IN1_E230
 #define FIRMWARE_NAME "Sequre e2"
 #define FILE_NAME "SEQURE_4IN1_E230"

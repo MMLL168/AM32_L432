@@ -18,6 +18,10 @@ extern void playInputTune2(void);
 extern void playBeaconTune3(void);
 extern void saveEEpromSettings(void);
 
+extern uint16_t dshot_goodcounts;  // CRC 正確的幀計數
+extern uint16_t dshot_badcounts;   // CRC 錯誤的幀計數
+extern uint16_t dshot_raw_value;   // 最新幀的原始 11-bit 值
+extern uint16_t dshot_frametime;   // 幀週期（timer ticks，可驗證 DSHOT600/300/150）
 extern char dshot_telemetry;
 extern char armed;
 extern char dir_reversed;

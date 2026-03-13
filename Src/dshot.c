@@ -61,6 +61,7 @@ uint32_t gcr[37] = { 0 };
 uint16_t dshot_frametime;
 uint16_t dshot_goodcounts;
 uint16_t dshot_badcounts;
+uint16_t dshot_raw_value;  // 每幀原始 11-bit 值（0=零油門, 1-47=指令, 48-2047=油門）
 uint8_t dshot_extended_telemetry = 0;
 uint16_t processtime = 0;
 uint16_t halfpulsetime = 0;
@@ -104,6 +105,7 @@ void computeDshotDMA()
         if (calcCRC == checkCRC) {
             signaltimeout = 0;
             dshot_goodcounts++;
+            dshot_raw_value = tocheck;
             if (dpulse[11] == 1) {
                 send_telemetry = 1;
             }

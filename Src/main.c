@@ -525,6 +525,9 @@ uint16_t gate_drive_offset = DEAD_TIME;
 uint8_t stuckcounter = 0;
 uint16_t k_erpm;
 uint16_t e_rpm; // electrical revolution /100 so,  123 is 12300 erpm
+uint16_t mech_rpm;        // mechanical RPM for Live Watch
+uint32_t sys_ms;          // milliseconds since boot (DWT, 80MHz, overflows ~53s)
+uint8_t  throttle_percent; // 油門百分比 0~100%（Live Watch 直覺顯示）
 
 uint16_t adjusted_duty_cycle;
 
@@ -634,11 +637,42 @@ void loadEEpromSettings()
     if (eepromBuffer.startup_power < 151 && eepromBuffer.startup_power > 49) {
             min_startup_duty = minimum_duty_cycle + eepromBuffer.startup_power;
     } else {
-        min_startup_duty = minimum_duty_cycle;
+        if (eepromBuffer.startup_power == 0xFF) {
+            min_startup_duty = minimum_duty_cycle + 80; // 預設 80（EEPROM 未初始化時 0xFF 超出範圍，min_startup_duty=0 導致起動力矩不足、失步循環）
+        } else {
+            min_startup_duty = minimum_duty_cycle;
+        }
     }
     startup_max_duty_cycle = minimum_duty_cycle + 400;  
 
+    if (eepromBuffer.bi_direction == 0xFF) {
+        eepromBuffer.bi_direction = 0; // 預設單向（EEPROM 未初始化 0xFF=255 為 truthy，觸發雙向輸入公式，50% 以上油門被重置為最低值）
+    }
+    if (eepromBuffer.rc_car_reverse == 0xFF) {
+        eepromBuffer.rc_car_reverse = 0; // 預設關閉（0xFF=truthy 會在 main() 強制 bi_direction=1，蓋掉上面的修正）
+    }
+    if (eepromBuffer.use_sine_start == 0xFF) {
+        eepromBuffer.use_sine_start = 0; // 預設關閉（0xFF 導致啟動門檻 = 47+80*255 = 20447，超過 input 最大值 2047，馬達永遠無法啟動）
+    }
+    if (eepromBuffer.stall_protection == 0xFF) {
+        eepromBuffer.stall_protection = 0; // 預設關閉（0xFF=truthy，stall PID 持續補償 duty，RC car/crawler 專用功能，多旋翼不適用，反而造成 desync）
+    }
+    if (eepromBuffer.stuck_rotor_protection == 0xFF) {
+        eepromBuffer.stuck_rotor_protection = 0; // 預設關閉（0xFF=truthy，bemf_timeout_happened > 10 時直接 allOff()，高油門 BEMF 時序偏移即誤觸發切電）
+    }
+    if (eepromBuffer.comp_pwm == 0xFF) {
+        eepromBuffer.comp_pwm = 1; // 預設啟用互補 PWM（HARDWARE_GROUP_L4_A 設計為互補輸出，comp_pwm=0 只靠體二極體飛輪，產生更多雜訊與卡頓聲）
+    }
+    if (eepromBuffer.auto_advance == 0xFF) {
+        eepromBuffer.auto_advance = 0; // 預設關閉動態超前角（0xFF=truthy，高 duty 時超前角最大 23°，BEMF 偵測視窗縮短→零交叉偵測失敗→desync）
+    }
+    if (eepromBuffer.brake_on_stop == 0xFF) {
+        eepromBuffer.brake_on_stop = 0; // 預設關閉停止制動（0xFF=truthy，停止時短路三相制動，對多旋翼無益且干擾低速 BEMF 偵測）
+    }
     motor_kv = (eepromBuffer.motor_kv * 40) + 20;
+    if (eepromBuffer.motor_kv == 0xFF) {
+        motor_kv = 2000; // 預設 2000KV（EEPROM 未初始化時 0xFF 導致 motor_kv=10220，low/high_rpm_level 極大，油門永遠被鎖在 400）
+    }
 #ifdef THREE_CELL_MAX
 		motor_kv =  motor_kv / 2;
 #endif
@@ -766,6 +800,9 @@ void loadEEpromSettings()
         
         if (motor_kv < 300) {
             low_rpm_throttle_limit = 0;
+        }
+        if (eepromBuffer.motor_poles == 0 || eepromBuffer.motor_poles > 28) {
+            eepromBuffer.motor_poles = 14; // 預設 14 極（MT2204 等常見小型馬達）
         }
         low_rpm_level = motor_kv / 100 / (32 / eepromBuffer.motor_poles);
         high_rpm_level = motor_kv / 12 / (32 / eepromBuffer.motor_poles);				
@@ -1700,11 +1737,14 @@ static void checkDeviceInfo(void)
 
 int main(void)
 {
-
     initAfterJump();
     checkDeviceInfo();
     initCorePeripherals();
     enableCorePeripherals();
+    // 啟用 DWT 週期計數器，供 sys_ms 時間戳使用（直接位址，不依賴 CMSIS 標頭）
+    *(volatile uint32_t*)0xE000EDFC |= (1u << 24); // CoreDebug DEMCR: TRCENA
+    *(volatile uint32_t*)0xE0001004  = 0;           // DWT CYCCNT 清零
+    *(volatile uint32_t*)0xE0001000 |= 1u;          // DWT CTRL: CYCCNTENA
     loadEEpromSettings();
 
     if (VERSION_MAJOR != eepromBuffer.version.major || VERSION_MINOR != eepromBuffer.version.minor || EEPROM_VERSION > eepromBuffer.eeprom_version) {
@@ -2088,6 +2128,9 @@ if(zero_crosses < 5){
 
             e_rpm = running * (600000 / e_com_time); // in tens of rpm
             k_erpm = e_rpm / 10; // ecom time is time for one electrical revolution in microseconds
+            mech_rpm = (e_rpm * 100) / (eepromBuffer.motor_poles >> 1); // 機械轉速 RPM（e_rpm=ERPM/100，需×100再除極對數）
+            sys_ms = (*(volatile uint32_t*)0xE0001004) / 80000u; // ms since boot（DWT CYCCNT, 80MHz, ~53s 溢位一次）
+            throttle_percent = (newinput > 47) ? (uint8_t)((newinput - 47) * 100u / 2000u) : 0; // 油門% = (raw-47)/2000×100
 
             if (low_rpm_throttle_limit) { // some hardware doesn't need this, its on
                                           // by default to keep hardware / motors
