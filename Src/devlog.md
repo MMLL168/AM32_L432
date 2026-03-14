@@ -252,3 +252,36 @@ auto_advance=0xFF → 高 duty 超前角 23°
 - `brake_on_stop == 0xFF` → 設為 0（關閉停止制動，低速 BEMF 偵測正常）
 
 ---
+
+## 2026-03-13（十）
+
+### 修改原因
+Live Watch 截圖（油門恆定 36%）顯示 `commutation_interval` 在 309~674 之間劇烈跳動（2 倍變化），而 `old_routine` 全程為 0（中斷模式），desync_happened 持續增加。
+
+**根本原因：`advance_level = 0xFF` → `temp_advance = 16` → BEMF 偵測視窗太窄**
+
+`0xFF > 42` 命中舊有安全檢查，設 `temp_advance = 16`：
+```c
+advance   = commutation_interval * 16/64 = commutation_interval/4
+waitTime  = commutation_interval/2 - commutation_interval/4 = commutation_interval/4
+```
+在 36% 油門 commutation_interval ≈ 322 時：
+- `waitTime = 80 counts`（BEMF 偵測視窗僅 80 counts，遠小於理論最大值 161 counts）
+- 視窗縮短 → 換相後 PWM 振鈴雜訊直接進入 `interruptRoutine()` filter_level 判斷
+- 雜訊偶爾通過 filter（filter_level ≈ 6 次確認）→ false zero-crossing
+- `thiszctime` 記錄錯誤時間點 → `waitTime` 計算偏移 → 下次換相時序突變
+- `average_interval` 跳動 > 50% → desync 觸發 → running=0 → 重啟循環
+
+反觀 66% 油門時 commutation_interval ≈ 252，BEMF 幅度更大，信噪比改善，偵測反而更穩定。
+
+**注意**：L4A 硬體沒有 g071 的 TIM1 OC4/OC5 comparator 硬體遮蔽，全靠 `filter_level` 軟體過濾，視窗窄時特別脆弱。
+
+### 解決方式
+在 `loadEEpromSettings()` 的 advance_level 現有安全檢查之前加入 0xFF 明確攔截：
+- `advance_level == 0xFF` → 設為 18（`temp_advance = 18-10 = 8`，7.5° 超前角）
+- `advance = commutation_interval * 8/64 = commutation_interval/8`
+- `waitTime = commutation_interval/2 - commutation_interval/8 = 3/8 * commutation_interval`
+- 選 18 而非 10（零超前角）：14 極馬達在 13000 RPM 附近實測以 14 失速，18=7.5° 為合理初值，兼顧 BEMF 視窗與換相效率
+- 後續如需調整超前角，使用 AM32 Configurator 設定 advance_level 10~42
+
+---

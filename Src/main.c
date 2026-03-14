@@ -609,7 +609,10 @@ void loadEEpromSettings()
       eepromBuffer.reserved_eeprom_3[2] = 0;
       eepromBuffer.reserved_eeprom_3[3] = 0;
     }
-    // eepromBuffer.advance_level can either be set to 0-3 with config tools less than 1.90 or 10-42 with 1.90 or above 
+    // eepromBuffer.advance_level can either be set to 0-3 with config tools less than 1.90 or 10-42 with 1.90 or above
+    if (eepromBuffer.advance_level == 0xFF) {
+        eepromBuffer.advance_level = 18; // 0xFF 未初始化：設為 7.5° 超前角（temp_advance=8）；advance 與 commutation_interval 成比例→角度恆定自適應速度；14(3.75°)在13000RPM失速
+    }
     if (eepromBuffer.advance_level > 42 || (eepromBuffer.advance_level < 10 && eepromBuffer.advance_level > 3)){
         temp_advance = 16;
     }
