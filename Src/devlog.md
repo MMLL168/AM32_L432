@@ -2,6 +2,22 @@
 
 ---
 
+## 2026-03-16
+
+### 修改原因
+驗證 Bidirectional DShot GCR eRPM 回傳功能。QGC 無法正常解鎖（GPS/EKF 限制），需要讓馬達在 FC 未解鎖狀態下自動轉動，以測試 ESC_STATUS.rpm 是否能在 QGC 顯示。
+
+### 解決方式
+1. **新增 `DEBUG_FORCE_THROTTLE` 機制**（`Inc/targets.h`、`Src/dshot.c`）：在 `NUCLEO_L432KC_L431` target 加入 `#define DEBUG_FORCE_THROTTLE 400`，dshot.c 的 `tocheck==0`（FC 送停止）處，若 `armed==1` 則改送 `newinput=400`（20% 油門）。`armed==0` 時維持 `newinput=0` 讓 ARM 序列正常完成。
+2. **測試結果**：QGC MAVLink Inspector → ESC_STATUS.rpm 成功顯示 `2785`，確認 Bidir DShot GCR eRPM 回傳功能正常運作。
+3. **還原**：測試完成後移除 `DEBUG_FORCE_THROTTLE` define 及 dshot.c 對應條件碼，恢復正常 DShot 輸入處理。
+
+### 補充觀察
+- 馬達斷電後 QGC 仍短暫顯示舊 RPM：屬正常行為，sensorless ESC 需等 `bemf_timeout_happened` 超閾值才偵測到停止（約數百 ms 延遲）。
+- `advance_level=18`（temp_advance=8，7.5° 固定超前角）在 13000 RPM 以下穩定，AM32 的固定超前角本身即按比例縮放（advance = commutation_interval × temp_advance / 64），不同轉速角度恆定。
+
+---
+
 ## 2026-03-12
 
 ### 修改原因
@@ -283,5 +299,33 @@ waitTime  = commutation_interval/2 - commutation_interval/4 = commutation_interv
 - `waitTime = commutation_interval/2 - commutation_interval/8 = 3/8 * commutation_interval`
 - 選 18 而非 10（零超前角）：14 極馬達在 13000 RPM 附近實測以 14 失速，18=7.5° 為合理初值，兼顧 BEMF 視窗與換相效率
 - 後續如需調整超前角，使用 AM32 Configurator 設定 advance_level 10~42
+
+---
+
+## 2026-03-16（研究記錄）
+
+### 主題：DShot 遙測 bit 與 Bidirectional DShot 協定的關係
+
+**結論：遙測 bit（bit 4）與雙向協定無關**
+
+DShot 幀結構（16-bit）：
+```
+[15:5] 11-bit 數值（0=停止, 1-47=指令, 48-2047=油門）
+[4]    遙測請求 bit → 1 = 請求 ESC 透過 UART 回傳遙測封包
+[3:0]  4-bit CRC
+```
+
+**AM32 如何判斷 Bidirectional DShot（`dshot.c` 第 89-97 行）：**
+- 自動偵測，不靠遙測 bit
+- 兩幀之間若 input pin 持續維持 HIGH 超過 100 次檢查 → `dshot_telemetry = 1`
+- 這代表 FC 送出的是**反相訊號**（Bidirectional DShot 的特徵：idle LOW → pin HIGH）
+- 一旦切換：CRC 驗證改用反相版本（`~checkCRC + 16`），且換相後自動回傳 GCR 編碼 eRPM
+
+| 模式 | 訊號極性 | Pin 閒置狀態 | ESC 回傳 |
+|------|---------|-------------|---------|
+| 標準 DShot | 正相 | LOW | 無（或 UART 另外） |
+| Bidirectional DShot | **反相** | **HIGH** | **GCR eRPM（同線）** |
+
+**目前測試設定**（Pixhawk QGC：DShot 單向）：`dshot_telemetry = 0`，標準模式，無 eRPM 回傳。
 
 ---
