@@ -321,7 +321,7 @@
 //#define USE_COMP1_BLANKING
 //#define COMP_BLANKING_MARGIN    200
 //#define COMP_MIN_BEMF_WINDOW    100
-#define NOMINAL_PWM             48000U  // 48kHz：ARR=1665，電流漣波減半→BEMF更乾淨，DEAD_TIME佔4.8%仍可接受
+#define NOMINAL_PWM             24000U  // 24kHz：ARR=3332，OFF窗口7.5μs（82%duty），振鈴沉澱後5.5μs乾淨BEMF
 #endif
 
 #ifdef SEQURE_4IN1_E230
