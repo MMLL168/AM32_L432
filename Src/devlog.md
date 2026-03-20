@@ -2,6 +2,278 @@
 
 ---
 
+## 2026-03-20
+
+### 修改原因
+移除虛擬中性點 10nF 電容後，mech_rpm 可到 16,000 RPM，但超過 16,000 就失步（零交叉重置）。
+調整 INTERVAL_TIMER gate 從 50%→40% 無效，問題根本原因確認：
+
+**高油門時 CCR5 被提前 clamp，切換噪音進入 BEMF 偵測視窗**：
+- COMP_MIN_BEMF_WINDOW=500：clamped CCR5 = 1665-500 = 1165
+- 78% 油門 adjusted_duty=1302 > CCR5=1165 → CNT 1165~1302 段 PWM 仍在 ON，但 blanking 已結束 → 切換噪音直接進入偵測窗口 → 假 ZC 通過 filter_level=20 確認 → 失步
+
+### 解決方式
+
+**`Inc/targets.h`**：重新啟用 `USE_COMP1_BLANKING`，將 `COMP_MIN_BEMF_WINDOW` 從 500 改為 100：
+```c
+#define USE_COMP1_BLANKING
+#define COMP_BLANKING_MARGIN    200
+#define COMP_MIN_BEMF_WINDOW    100   // 原 500 → 100
+```
+
+效果：
+- 78% 油門：CCR5 = 1302+200 = 1502（完整覆蓋 duty+振鈴），BEMF 窗口 = 163 ticks = 2μs/cycle
+- 90% 油門：CCR5 clamp 到 1665-100=1565，仍高於 duty=1499，提供 66 ticks 振鈴沉澱 + 100 ticks BEMF 窗口
+
+其他本次有效修改（本日確認）：
+- 虛擬中性點 10nF 電容移除：BEMF 訊號品質大幅提升，RPM 從 1000 → 16,000
+- COMP1 hysteresis = MEDIUM (25mV)：過濾 PWM 雜訊
+- filter_level = 20（固定）：提高噪音拒絕能力
+- PWM 頻率 48kHz（原 24kHz）：電流漣波減半，BEMF 更乾淨
+- INTERVAL_TIMER gate = 40%（原 50%）：高速時 ZC 更早被接受
+
+---
+
+## 2026-03-19（五）
+
+### 修改原因
+回顧 devlog 後確認：12000 RPM 是在**完全沒有任何 blanking** 的狀態下達到的（2026-03-17 記錄）。當時失速的根因是假 ZC → commutation_interval 縮短 → k_erpm 上升 → `duty_cycle_maximum` 被 `map(k_erpm, low_rpm_level, high_rpm_level, ...)` 壓低（doom loop，前提是 `low_rpm_throttle_limit=1`）。
+
+但 `low_rpm_throttle_limit=0` 早在 2026-03-19 修正時就已套用（`#ifdef NUCLEO_L432KC_L431` 強制設為 0）。doom loop 條件不再成立。
+
+**根本原因：軟體 blanking（`CNT < CCR5`）是多餘的，且反而遮蔽有效 BEMF 訊號**
+
+- 測試 `COMP_ORDER_L4_A_540`（A↔C 對調）→ 馬達更糟，確認原始 045 接線正確
+- 軟體 blanking 使 COMP 中斷在 CNT < CCR5 期間全部被丟棄；高 duty 時 CCR5=2832（佔 85% 週期），大量真實 ZC 訊號被遮蔽 → 卡在 1000 RPM
+
+### 解決方式
+
+**`Inc/targets.h`**：移除 `USE_COMP1_BLANKING`（改為 comment out）：
+```c
+// 改前：
+#define USE_COMP1_BLANKING
+// 改後：
+//#define USE_COMP1_BLANKING   // 已停用（doom loop 根因已由 low_rpm_throttle_limit=0 修正）
+```
+
+**`COMP_ORDER_L4_A_540` 測試結果**：更糟，已改回 045（原接線正確）。
+
+**測試結果**：移除 blanking 後 mech_rpm 提升至 8500-9700 RPM（35% 油門），bemf_timeout=0，old_routine=0，zero_crosses 穩定累積。但每約 0.5 秒出現一次 desync（zero_crosses 歸零後重新累積）→ 推斷 PWM 切換噪音偶爾穿透 COMP1 造成假 ZC。
+
+**追加修正：COMP1 輸入磁滯（hysteresis）**
+
+在 `Mcu/l431/Src/peripherals.c` MX_COMP1_Init：
+```c
+// 改前：
+COMP_InitStruct.InputHysteresis = LL_COMP_HYSTERESIS_NONE;
+// 改後：
+COMP_InitStruct.InputHysteresis = LL_COMP_HYSTERESIS_MEDIUM;  // 25mV，過濾 PWM 噪音
+```
+
+STM32L4 COMP1 磁滯選項：NONE(0mV) / LOW(10mV) / MEDIUM(25mV) / HIGH(50mV)。
+選 MEDIUM：12V 系統 BEMF 真實 ZC 幅度為數百 mV（分壓後），25mV 磁滯可過濾 PWM 切換雜訊，但不影響正常 ZC 偵測。
+
+**追加：診斷快照 `dbg_snap`**
+
+在 `Src/main.c` 新增 `volatile DbgSnap_t dbg_snap`，於每次 waitTime 計算後同步寫入所有關鍵欄位（comm_interval, advance, waitTime, filter_level, zero_crosses, duty_cycle, adjusted_duty, input, old_routine, bemf_timeout），確保 Live Watch 截圖時所有數值屬於同一 commutation cycle，避免異步讀值造成誤判。
+
+---
+
+## 2026-03-19（六）
+
+### 硬體關鍵發現：虛擬中性點 10nF 電容造成 BEMF 相位偏移
+
+**現象**：移除虛擬中性點對 GND 的 10nF 濾波電容後，mech_rpm 從原本卡在 ~1000-1300 RPM 大幅提升至 **14,214 RPM**（69% 油門），zero_crosses 穩定維持 10000，bemf_timeout=0，old_routine=0。
+
+**根本原因**：10nF 電容與虛擬中性點分壓電阻形成 RC 低通濾波器，在換相頻率（~10kHz）附近引入相位延遲，導致 COMP1 偵測到的零交叉點時序偏離真實 BEMF ZC 時間點。此時序誤差造成換相過早/過晚 → 假 ZC 或漏 ZC → desync 循環。
+
+**結論**：虛擬中性點（PA1）**不應加對 GND 的濾波電容**。若需要雜訊過濾，應選用更小容值（< 1nF）或改用串聯電阻方式，避免在 BEMF 頻率範圍內引入過大相位誤差。
+
+**當前狀態（filter_level=16, COMP MEDIUM hysteresis, 48kHz PWM）**：
+- mech_rpm：14,214 @ 69% 油門
+- commutation_interval：203 ticks（101.5μs）
+- advance：12 ticks，waitTime：87 ticks
+- 偶爾 desync，尚在調查中
+
+---
+
+## 2026-03-19（四）
+
+### 修改原因
+12 張 Live Watch 截圖顯示軟體 blanking 修正有效（bemf_timeout 從 10-58 降至幾乎 0，old_routine=0 在 35-57% 油門成功運作，zero_crosses 累積至 527）。但馬達 RPM 仍卡在 ~1000-1250 RPM，無法加速。
+
+**根本原因：高 duty 時 CCR5=0 造成完全無過濾**
+
+原本 COMP_MIN_BEMF_WINDOW 邏輯：當 blanking_ccr + 500 >= tim1_arr 時設 CCR5=0（「停用 blanking」）。但 CCR5=0 等於軟體 blanking 門檻為 0，`CNT < 0` 恆 FALSE → 所有 COMP 邊緣都通過 → 高 duty（≥79%）時 PWM 切換噪音完全無過濾 → 偶爾假換相 → desync → zero_crosses 重置 → 循環卡在 startup。
+
+截圖 9（79% 油門）：adj_duty=2634，CCR5=**0** → 噪音無過濾。截圖 11（100% 油門）：adj_duty=3333，CCR5=**0** → 同樣問題。
+
+### 解決方式
+
+**`Src/main.c`** CCR5 高 duty 路徑改為 clamp（不設為 0）：
+```c
+// 改前：TIM1->CCR5 = 0;
+// 改後：
+TIM1->CCR5 = (uint16_t)((uint32_t)tim1_arr - COMP_MIN_BEMF_WINDOW); // = 2832
+```
+
+效果：CCR5 最大 = 3332-500 = **2832**，確保：
+- 軟體 blanking 始終覆蓋 0 到 CCR5 範圍（噪音被過濾）
+- BEMF 偵測視窗始終至少 500 ticks（6.25μs）
+- CCR5 永遠不為 0
+
+---
+
+## 2026-03-19（三）
+
+### 修改原因
+10 張 Live Watch 截圖顯示 `filter_level` 所有截圖均卡在 **12（最大值）**，`bemf_timeout_happened` 持續 10-58，馬達無法穩定加速。
+
+**根本原因：TIM1 OC5 硬體 blanking 的「遮蔽結束假邊緣」**
+
+每個 PWM 週期（41.7μs）：
+1. CNT=0：OC5→HIGH，COMP1 輸出強制為 0
+2. CNT=CCR5：OC5→LOW，COMP1 恢復真實值
+3. 若真實 COMP=HIGH → EXTI 看到 0→1 rising edge（假邊緣）
+4. COMP_IRQHandler 觸發，此時 CNT ≥ CCR5 → CNT < CCR5 檢查失效
+5. INTERVAL_TIMER < average/2（才剛換相）→ else branch
+6. getCompOutputLevel()==rising(0) → 1==0 FALSE → flag 沒清除
+7. NVIC 立即重觸發 → 繞圈約 4000 次 → INTERVAL_TIMER 過半 → interruptRoutine() 假換相 → desync
+8. filter_level 因此卡在 12，真實 ZC 被一起濾掉
+
+此問題每 41.7μs 發生一次（rising=0 步驟，佔 50%）。
+
+### 解決方式
+
+**`Mcu/l431/Src/peripherals.c`**：
+- 移除 COMP1 硬體 blanking：`OutputBlankingSource = LL_COMP_BLANKINGSRC_NONE`
+- COMP_IRQHandler 的軟體檢查 `if (TIM1->CNT < TIM1->CCR5)` 仍保留有效
+- TIM1->CCR5 仍由 main.c 動態更新（軟體門檻）
+- 不再有 OC5→COMP1 閘控假邊緣，CPU overhead ~3-4%
+
+---
+
+## 2026-03-19（二）
+
+### 修改原因
+燒錄 `low_rpm_throttle_limit=0` 修正後，9 張 Live Watch 截圖顯示 `duty_cycle_maximum` 已升至 2000（修正有效），但 43%+ 油門時 `bemf_timeout_happened` 持續累積至 11-48，`zero_crosses` 僅 2-19，馬達持續 desync 無法加速。
+
+**根本原因：高 duty 時 blanking 遮蔽整個 BEMF 偵測視窗**
+
+CCR5 計算：`blanking_ccr = adjusted_duty_cycle + 200`。
+- 低油門（17%，duty=355）：adj_duty=592，CCR5=792 → blanking 佔 24% → 76% BEMF 視窗 → 正常（bemf_timeout≈0）
+- 高油門（100%，duty=2000）：adj_duty=3332，blanking_ccr=3532 → clamped 至 3331（= tim1_arr-1）→ 99.97% blanked → COMP1 幾乎永遠關閉 → 零交叉完全無法偵測 → 立即 desync
+
+**加速過程的觸發機制**：
+1. startup cap（400）→ zero_crosses 到 100 → duty 跳到目標值（866 或 2000）
+2. adj_duty 急升 → CCR5 跟著升高 → blanking 遮蔽幾乎全部 BEMF 視窗
+3. 無 ZC → bemf_timeout 累積 → old_routine → zero_crosses 重置 → 循環
+
+### 解決方式
+
+**`Inc/targets.h`** NUCLEO_L432KC_L431 section 新增：
+```c
+#define COMP_MIN_BEMF_WINDOW    500   // 高 duty 時保留的最小 BEMF 偵測視窗（~6.25μs）
+```
+
+**`Src/main.c`** CCR5 更新邏輯改為：
+```c
+uint32_t blanking_ccr = (uint32_t)adjusted_duty_cycle + COMP_BLANKING_MARGIN;
+if (blanking_ccr + COMP_MIN_BEMF_WINDOW >= (uint32_t)tim1_arr) {
+    TIM1->CCR5 = 0;  // 高 duty 停用 blanking，保留 BEMF 偵測視窗
+} else {
+    TIM1->CCR5 = (uint16_t)blanking_ccr;
+}
+```
+
+**門檻計算**：adj_duty >= 3332-200-500=2632（= duty_cycle 1579/2000 = 79%）時停用 blanking。
+此時 BEMF 視窗夠大（500 ticks = 6.25μs），PWM 振鈴在高轉速下衰減更快，blanking 效益減低，直接停用影響較小。
+
+---
+
+## 2026-03-19
+
+### 修改原因
+燒錄 blanking 修正（中斷風暴已解決）後，9 張 Live Watch 截圖顯示馬達仍無法超過 1285 RPM，且不論油門 28%/53%/100%，`duty_cycle_maximum` 永遠停在 **400**。
+
+**根本原因（EEPROM 修正的副作用）：**
+
+1. `duty_cycle_maximum = map(k_erpm, low_rpm_level=11, high_rpm_level=95, 400, 2000)` — k_erpm=4~10 均 < low_rpm_level=11，`map()` 回傳最低值 400，永遠鎖死
+2. k_erpm 無法突破 11（= 1571 RPM 機械），因為 400 duty（= 20% × 12V = 2.4V 等效）帶槳時最多約 1285 RPM — 永遠低於 1571 RPM 門檻 → doom loop（duty 鎖 → RPM 低 → k_erpm 低 → duty 繼續鎖）
+3. **副作用來源**：EEPROM 舊值 `motor_kv == 0xFF` 時，救援程式碼設了 `low_rpm_throttle_limit = 0`（保護停用）。修正 EEPROM 存入 motor_kv=57 後，下次開機 0xFF 條件不觸發 → `low_rpm_throttle_limit` 回預設值 1（保護開啟）→ 油門被鎖
+4. **附加確認**：`adjusted_duty_cycle = 667 = 400×3332/2000`，即 TIM1_AUTORELOAD=3332（80MHz/24kHz-1，預設 24kHz，非 40kHz）。CCR5=867=667+200 ✓ blanking 計算正確。`bemf_timeout_happened = 0` ✓ 中斷風暴已消除。
+
+### 解決方式
+在 `Src/main.c` `loadEEpromSettings()` 中 `low_rpm_level`/`high_rpm_level` 計算之後加入：
+```c
+#ifdef NUCLEO_L432KC_L431
+    low_rpm_throttle_limit = 0; // 開發板無過流風險，停用低轉速油門上限
+#endif
+```
+其他 target 不受影響。開發板帶槳測試無需此保護；正式量產 ESC 仍維持保護機制。
+
+---
+
+## 2026-03-17（二）
+
+### 修改原因
+燒錄 blanking 韌體後馬達反而更差：`mech_rpm` 最高 1785、多數 342~400，`bemf_timeout_happened` 持續累計到 11，`zero_crosses` 僅 22~90，`old_routine=1`（polling 模式），`filter_level=12`（卡頂）。
+
+**根本原因：blanking 引發 EXTI 中斷風暴**
+
+TIM1 OC5 blanking 啟動時，COMP1 輸出被強制拉到 0（LOW）。若當時 EXTI 設為 falling edge 觸發（`rising=1` 情況），此強制拉低會觸發假邊緣 → `COMP_IRQHandler` 被呼叫 → 計時器未達 `average_interval/2` 門檻 → 進入 else 分支 → `getCompOutputLevel() == rising (=1)` 為 FALSE（因 COMP 被 blanking 強制為 0）→ flag **不被清除** → 中斷 handler 返回後 NVIC 再次觸發 → 無限中斷風暴。
+
+每個 40kHz PWM 週期（25μs）都會產生這個風暴，完全佔用 CPU，DShot DMA 回調無法執行，throttle 無法更新，馬達無法正常控制。
+
+### 解決方式
+在 **`Mcu/l431/Src/stm32l4xx_it.c`** `COMP_IRQHandler()` 中，EXTI flag 確認後加入 blanking 視窗檢查：
+
+```c
+#ifdef USE_COMP1_BLANKING
+    if (TIM1->CNT < TIM1->CCR5) {
+        LL_EXTI_ClearFlag_0_31(EXTI_LINE);
+        return;  // blanking 視窗內的假邊緣，直接清除 flag 打破風暴
+    }
+#endif
+```
+
+原理：blanking 期間（`TIM1->CNT < TIM1->CCR5`），COMP1 輸出是硬體強制的，不是真實 BEMF。發現此情況時立即清除 EXTI flag 並返回，避免中斷風暴。blanking 結束後（CNT ≥ CCR5），COMP1 恢復真實比較，正常 ZC 偵測重新生效。
+
+---
+
+## 2026-03-17
+
+### 修改原因
+Live Watch 觀察確認：input=1272 時 duty_cycle 升至 1224，`commutation_interval` 出現異常短值（195 ticks，等效 ~7300 RPM，遠低於實際轉速），`advance` 數值與當下 `commutation_interval` 不對應 → 確認為 COMP1 無硬體 blanking，PWM 高 duty 切換振鈴穿透比較器，觸發假零交叉 → 換相時序紊亂 → mech_rpm 從 12000 掉回 8000 → duty_cycle_maximum 隨 k_erpm 下降被壓低 → doom loop。
+
+### 解決方式
+實作 **TIM1 OC5 → COMP1 hardware blanking**，三檔修改：
+
+1. **`Inc/targets.h`**（`NUCLEO_L432KC_L431` 區段）：新增 `#define USE_COMP1_BLANKING` 和 `#define COMP_BLANKING_MARGIN 200`（~2.5μs at 80MHz）。用 `#ifdef` 保持其他 target 不受影響。
+
+2. **`Mcu/l431/Src/peripherals.c`** `MX_TIM1_Init()`：
+   - 在 CH4 初始化後加入 TIM1 CH5 配置（CCMR3=PWM mode 1+preload，CCER bit16 CC5E，CCR5=0）。CH5 無 GPIO 輸出，為純內部 blanking 信號。
+   - COMP1 `OutputBlankingSource` 從 `LL_COMP_BLANKINGSRC_NONE` 改為 `LL_COMP_BLANKINGSRC_TIM1_OC5_COMP1`（含 `#ifdef` 條件編譯）。
+
+3. **`Src/main.c`** `tenKhzRoutine()` SET_DUTY_CYCLE_ALL 之後：動態更新 `TIM1->CCR5 = adjusted_duty_cycle + COMP_BLANKING_MARGIN`（上限 tim1_arr-1）。邏輯：TIM1 UP 計數，CNT < CCR5 時 OC5 HIGH → COMP1 blanked，涵蓋 PWM 導通期 + 振鈴 margin。
+
+---
+
+## 2026-03-16（三）
+
+### 修改原因
+Debug 模式下 Live Watch 顯示多個 EEPROM 欄位含非 0xFF 的無效值（`use_sine_start=48`、`advance_level=162`、`motor_poles=146`），導致馬達完全無法啟動。根本原因：既有安全攔截只針對 `== 0xFF`，無法攔截 EEPROM 中其他非法值。其中 `use_sine_start=48` 造成啟動門檻 = `47 + 80×48 = 3887 > 2047`，是馬達不動的直接原因。
+
+### 解決方式
+修改 `Src/main.c` `loadEEpromSettings()` 函數，將所有 boolean/enum EEPROM 欄位從「只攔截 0xFF」改為「值域範圍檢查」：
+
+1. **boolean 欄位（只允許 0 或 1）**：`dir_reversed`、`bi_direction`、`rc_car_reverse`、`use_sine_start`、`stall_protection`、`stuck_rotor_protection`、`comp_pwm`、`auto_advance`、`brake_on_stop`、`telemetry_on_interval` → 改為 `> 1` 條件，涵蓋 0xFF 及其他非法值（如 48、162）
+2. **`variable_pwm`（0/1/2 三態）**：改為 `> 2` 條件
+3. **`advance_level` 無效值**：在 `> 42 || (< 10 && > 3)` 分支中加入 `eepromBuffer.advance_level = 14`，避免無效值（如 162）殘留在 buffer 中，讓後續 `< 43 && > 9` 條件能正常計算 `temp_advance = 4`
+4. **`eeprom_needs_save` 機制**：新增全域旗標 `uint8_t eeprom_needs_save`；`loadEEpromSettings()` 每次修正任何欄位時設為 1；`main()` 版本比對條件加入 `|| eeprom_needs_save`，觸發 `saveEEpromSettings()` 寫回 Flash。確保第一次開機修正後，EEPROM 實際儲存正確值，後續開機不再需要修正。
+
+---
+
 ## 2026-03-16
 
 ### 修改原因
@@ -299,6 +571,36 @@ waitTime  = commutation_interval/2 - commutation_interval/4 = commutation_interv
 - `waitTime = commutation_interval/2 - commutation_interval/8 = 3/8 * commutation_interval`
 - 選 18 而非 10（零超前角）：14 極馬達在 13000 RPM 附近實測以 14 失速，18=7.5° 為合理初值，兼顧 BEMF 視窗與換相效率
 - 後續如需調整超前角，使用 AM32 Configurator 設定 advance_level 10~42
+
+---
+
+## 2026-03-16（二）
+
+### 修改原因
+全面審查 EEPROM 預設值，補足遺漏的 0xFF 安全攔截，確保所有影響多旋翼行為的欄位在 EEPROM 未初始化時都有安全預設值。同時修正 `filter_level` 最小值以提升高速 BEMF 雜訊過濾能力。
+
+### 解決方式（`Src/main.c` `loadEEpromSettings()` 及主迴圈）
+
+**新增 0xFF 安全攔截（多旋翼導向）：**
+
+1. `dir_reversed == 0xFF` → 設為 0（預設正轉，0xFF 為 truthy 可能影響換相方向邏輯）
+2. `variable_pwm == 0xFF` → 設為 0（預設固定 PWM，0xFF 不等於任何有效值 0/1/2，設為 0 避免未定義行為）
+3. `telemetry_on_interval == 0xFF` → 設為 0（預設關閉週期遙測，DShot 模式使用 GCR eRPM 回傳，不需要 UART 週期遙測；0xFF → 每 255×1.1ms ≈ 284ms 發一次，浪費 CPU）
+4. `motor_kv == 0xFF` → `motor_kv = 2300`（從舊值 2000 更新為實際馬達 MT2204-2300KV），`low_rpm_throttle_limit = 0`（電源供應器已限流，停用低轉速功率保護）
+
+**`advance_level` 調整：**
+- 初次修正設為 18（7.5°），實測與 14（3.75°）效果相同，12000 RPM 以上仍然失速
+- 非單調行為：7.5° 在高速時 BEMF 視窗縮短，反而不如 3.75°
+- **最終設為 14**（temp_advance = 4，3.75°），目前最佳實測值
+
+**`filter_level` 最小值修正（主迴圈 ≈ 第 2168 行）：**
+```c
+// 修改前
+filter_level = map(average_interval, 100, 500, 3, 12);
+// 修改後
+filter_level = map(average_interval, 100, 500, 5, 12); // 最小值從 3 改為 5
+```
+高速時（average_interval 接近 100）filter_level 從 3 提升至 5，需要連續 5 次取樣確認才算有效零交叉，減少 PWM 切換雜訊造成假零交叉導致 desync。
 
 ---
 

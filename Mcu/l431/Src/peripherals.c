@@ -197,7 +197,7 @@ void MX_COMP1_Init(void)
   COMP_InitStruct.PowerMode = LL_COMP_POWERMODE_HIGHSPEED;
   COMP_InitStruct.InputPlus = LL_COMP_INPUT_PLUS_IO3;
   COMP_InitStruct.InputMinus = LL_COMP_INPUT_MINUS_IO5;
-  COMP_InitStruct.InputHysteresis = LL_COMP_HYSTERESIS_NONE;
+  COMP_InitStruct.InputHysteresis = LL_COMP_HYSTERESIS_MEDIUM;  // 25mV 磁滯：過濾噪音同時不影響低幅度 BEMF 偵測
   COMP_InitStruct.OutputPolarity = LL_COMP_OUTPUTPOL_NONINVERTED;
   COMP_InitStruct.OutputBlankingSource = LL_COMP_BLANKINGSRC_NONE;
   LL_COMP_Init(COMP1, &COMP_InitStruct);
@@ -351,6 +351,17 @@ void MX_TIM1_Init(void)
     TIM_OC_InitStruct.OCNState = LL_TIM_OCSTATE_DISABLE;
     LL_TIM_OC_Init(TIM1, LL_TIM_CHANNEL_CH4, &TIM_OC_InitStruct);
     LL_TIM_OC_DisableFast(TIM1, LL_TIM_CHANNEL_CH4);
+
+#ifdef USE_COMP1_BLANKING
+    // TIM1 CH5：內部 blanking 信號（無 GPIO 輸出），高電位時遮蔽 COMP1 輸出
+    // PWM mode 1 + preload：CNT < CCR5 → OC5 HIGH → COMP1 blanked
+    TIM1->CCMR3 = TIM_CCMR3_OC5PE          // Preload enable（避免 CCR5 更新撕裂）
+               | TIM_CCMR3_OC5M_1          // PWM mode 1（110）
+               | TIM_CCMR3_OC5M_2;
+    TIM1->CCR5  = 0;                        // 初始：無遮蔽，由 tenKhzRoutine 動態更新
+    TIM1->CCER |= (1UL << 16);             // CC5E：啟用 CH5 內部輸出
+#endif
+
     LL_TIM_SetTriggerOutput(TIM1, LL_TIM_TRGO_RESET);
     LL_TIM_DisableMasterSlaveMode(TIM1);
     TIM_BDTRInitStruct.OSSRState = LL_TIM_OSSR_DISABLE;

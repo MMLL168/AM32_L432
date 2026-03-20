@@ -277,10 +277,17 @@ void COMP_IRQHandler(void)
 {
 
     if (LL_EXTI_IsActiveFlag_0_31(EXTI_LINE) != RESET) {
-      if((INTERVAL_TIMER->CNT) > ((average_interval>>1))){
+#ifdef USE_COMP1_BLANKING
+      // blanking 視窗內（TIM1 OC5 強制 COMP1=0）產生的假邊緣，直接清除避免中斷風暴
+      if (TIM1->CNT < TIM1->CCR5) {
+          LL_EXTI_ClearFlag_0_31(EXTI_LINE);
+          return;
+      }
+#endif
+      if((INTERVAL_TIMER->CNT) > ((average_interval * 2 / 5))){  // 40%（原50%）：高速時 ZC 更早被接受，避免在邊界被拒
        LL_EXTI_ClearFlag_0_31(EXTI_LINE);
       interruptRoutine();
-  }else{ 
+  }else{
       if (getCompOutputLevel() == rising){
       LL_EXTI_ClearFlag_0_31(EXTI_LINE);
   }

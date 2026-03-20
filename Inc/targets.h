@@ -310,11 +310,18 @@
 #define FIRMWARE_NAME           "L432KC"
 #define DEAD_TIME               80
 #define HARDWARE_GROUP_L4_A
+//#define COMP_ORDER_L4_A_540
 #define COMP_ORDER_L4_A_045
 #define TARGET_VOLTAGE_DIVIDER  260
 #define USE_SERIAL_TELEMETRY
 #define RAMP_SPEED_LOW_RPM      1
 #define RAMP_SPEED_HIGH_RPM     1
+// 軟體 blanking 不可行：ZC 發生在 blanking 視窗內時 EXTI 邊緣被 clear，
+// COMP 輸出停留在 HIGH 無後續邊緣 → ZC 永久丟失 → BEMF timeout → 失步。
+//#define USE_COMP1_BLANKING
+//#define COMP_BLANKING_MARGIN    200
+//#define COMP_MIN_BEMF_WINDOW    100
+#define NOMINAL_PWM             48000U  // 48kHz：ARR=1665，電流漣波減半→BEMF更乾淨，DEAD_TIME佔4.8%仍可接受
 #endif
 
 #ifdef SEQURE_4IN1_E230

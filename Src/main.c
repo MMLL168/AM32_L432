@@ -309,7 +309,8 @@ volatile uint8_t max_ramp_startup = RAMP_SPEED_STARTUP;
 volatile uint8_t max_ramp_low_rpm = RAMP_SPEED_LOW_RPM;
 volatile uint8_t max_ramp_high_rpm = RAMP_SPEED_HIGH_RPM;
 char send_esc_info_flag;
-uint32_t eeprom_address = EEPROM_START_ADD; 
+uint32_t eeprom_address = EEPROM_START_ADD;
+uint8_t eeprom_needs_save = 0; // 若 loadEEpromSettings() 修正了任何非法值，設為 1 → 觸發 saveEEpromSettings()
 uint16_t prop_brake_duty_cycle = 0;
 uint16_t ledcounter = 0;
 uint16_t ramp_count;
@@ -546,6 +547,21 @@ char dshot = 0;
 char servoPwm = 0;
 uint32_t zero_crosses;
 
+// 診斷快照：每次換相時序計算後同步更新，Live Watch 截圖時數值一致
+typedef struct {
+    uint32_t comm_interval;     // commutation_interval（同 cycle）
+    int32_t  advance;           // advance ticks
+    int32_t  waitTime;          // waitTime ticks
+    uint8_t  filter_level;      // 當前 ZC 過濾次數
+    uint32_t zero_crosses;      // ZC 計數（10000=穩定）
+    uint16_t duty_cycle;        // 原始 duty（0-2000）
+    uint16_t adjusted_duty;     // scaled duty（0-ARR）
+    uint16_t input;             // Pixhawk 輸入值
+    uint8_t  old_routine;       // 1=open-loop, 0=BEMF
+    uint8_t  bemf_timeout;      // bemf_timeout_happened
+} DbgSnap_t;
+volatile DbgSnap_t dbg_snap;
+
 uint8_t zcfound = 0;
 
 uint8_t bemfcounter;
@@ -594,6 +610,7 @@ int32_t doPidCalculations(struct fastPID* pidnow, int actual, int target)
 
 void loadEEpromSettings()
 {
+    eeprom_needs_save = 0; // 每次重新載入時先清旗標
     read_flash_bin(eepromBuffer.buffer, eeprom_address, sizeof(eepromBuffer.buffer));
     if(eepromBuffer.eeprom_version < EEPROM_VERSION){
       eepromBuffer.max_ramp = 160;    // 0.1% per ms to 25% per ms 
@@ -611,10 +628,11 @@ void loadEEpromSettings()
     }
     // eepromBuffer.advance_level can either be set to 0-3 with config tools less than 1.90 or 10-42 with 1.90 or above
     if (eepromBuffer.advance_level == 0xFF) {
-        eepromBuffer.advance_level = 18; // 0xFF 未初始化：設為 7.5° 超前角（temp_advance=8）；advance 與 commutation_interval 成比例→角度恆定自適應速度；14(3.75°)在13000RPM失速
+        eepromBuffer.advance_level = 14; eeprom_needs_save = 1; // 0xFF 未初始化 → 預設 14
     }
     if (eepromBuffer.advance_level > 42 || (eepromBuffer.advance_level < 10 && eepromBuffer.advance_level > 3)){
         temp_advance = 16;
+        eepromBuffer.advance_level = 14; eeprom_needs_save = 1; // 無效值（如 162）→ 重置為 14
     }
     if (eepromBuffer.advance_level < 4) {         // old format needs to be converted to 0-32 range
         temp_advance = (eepromBuffer.advance_level<<3);
@@ -648,33 +666,23 @@ void loadEEpromSettings()
     }
     startup_max_duty_cycle = minimum_duty_cycle + 400;  
 
-    if (eepromBuffer.bi_direction == 0xFF) {
-        eepromBuffer.bi_direction = 0; // 預設單向（EEPROM 未初始化 0xFF=255 為 truthy，觸發雙向輸入公式，50% 以上油門被重置為最低值）
-    }
-    if (eepromBuffer.rc_car_reverse == 0xFF) {
-        eepromBuffer.rc_car_reverse = 0; // 預設關閉（0xFF=truthy 會在 main() 強制 bi_direction=1，蓋掉上面的修正）
-    }
-    if (eepromBuffer.use_sine_start == 0xFF) {
-        eepromBuffer.use_sine_start = 0; // 預設關閉（0xFF 導致啟動門檻 = 47+80*255 = 20447，超過 input 最大值 2047，馬達永遠無法啟動）
-    }
-    if (eepromBuffer.stall_protection == 0xFF) {
-        eepromBuffer.stall_protection = 0; // 預設關閉（0xFF=truthy，stall PID 持續補償 duty，RC car/crawler 專用功能，多旋翼不適用，反而造成 desync）
-    }
-    if (eepromBuffer.stuck_rotor_protection == 0xFF) {
-        eepromBuffer.stuck_rotor_protection = 0; // 預設關閉（0xFF=truthy，bemf_timeout_happened > 10 時直接 allOff()，高油門 BEMF 時序偏移即誤觸發切電）
-    }
-    if (eepromBuffer.comp_pwm == 0xFF) {
-        eepromBuffer.comp_pwm = 1; // 預設啟用互補 PWM（HARDWARE_GROUP_L4_A 設計為互補輸出，comp_pwm=0 只靠體二極體飛輪，產生更多雜訊與卡頓聲）
-    }
-    if (eepromBuffer.auto_advance == 0xFF) {
-        eepromBuffer.auto_advance = 0; // 預設關閉動態超前角（0xFF=truthy，高 duty 時超前角最大 23°，BEMF 偵測視窗縮短→零交叉偵測失敗→desync）
-    }
-    if (eepromBuffer.brake_on_stop == 0xFF) {
-        eepromBuffer.brake_on_stop = 0; // 預設關閉停止制動（0xFF=truthy，停止時短路三相制動，對多旋翼無益且干擾低速 BEMF 偵測）
-    }
+    if (eepromBuffer.dir_reversed > 1)          { eepromBuffer.dir_reversed = 0;            eeprom_needs_save = 1; }
+    if (eepromBuffer.variable_pwm > 2)          { eepromBuffer.variable_pwm = 0;            eeprom_needs_save = 1; }
+    if (eepromBuffer.telemetry_on_interval > 1) { eepromBuffer.telemetry_on_interval = 0;   eeprom_needs_save = 1; }
+    if (eepromBuffer.bi_direction > 1)          { eepromBuffer.bi_direction = 0;             eeprom_needs_save = 1; }
+    if (eepromBuffer.rc_car_reverse > 1)        { eepromBuffer.rc_car_reverse = 0;           eeprom_needs_save = 1; }
+    if (eepromBuffer.use_sine_start > 1)        { eepromBuffer.use_sine_start = 0;           eeprom_needs_save = 1; } // 48/0xFF → 啟動門檻爆表 → 馬達不動
+    if (eepromBuffer.stall_protection > 1)      { eepromBuffer.stall_protection = 0;         eeprom_needs_save = 1; }
+    if (eepromBuffer.stuck_rotor_protection > 1){ eepromBuffer.stuck_rotor_protection = 0;   eeprom_needs_save = 1; }
+    if (eepromBuffer.comp_pwm > 1)              { eepromBuffer.comp_pwm = 1;                 eeprom_needs_save = 1; }
+    if (eepromBuffer.auto_advance > 1)          { eepromBuffer.auto_advance = 0;             eeprom_needs_save = 1; }
+    if (eepromBuffer.brake_on_stop > 1)         { eepromBuffer.brake_on_stop = 0;            eeprom_needs_save = 1; }
     motor_kv = (eepromBuffer.motor_kv * 40) + 20;
     if (eepromBuffer.motor_kv == 0xFF) {
-        motor_kv = 2000; // 預設 2000KV（EEPROM 未初始化時 0xFF 導致 motor_kv=10220，low/high_rpm_level 極大，油門永遠被鎖在 400）
+        motor_kv = 2300; // 預設 2300KV（MT2204-2300KV）
+        eepromBuffer.motor_kv = (2300 - 20) / 40; // 57 → 2300KV
+        low_rpm_throttle_limit = 0;
+        eeprom_needs_save = 1;
     }
 #ifdef THREE_CELL_MAX
 		motor_kv =  motor_kv / 2;
@@ -805,11 +813,14 @@ void loadEEpromSettings()
             low_rpm_throttle_limit = 0;
         }
         if (eepromBuffer.motor_poles == 0 || eepromBuffer.motor_poles > 28) {
-            eepromBuffer.motor_poles = 14; // 預設 14 極（MT2204 等常見小型馬達）
+            eepromBuffer.motor_poles = 14; eeprom_needs_save = 1;
         }
         low_rpm_level = motor_kv / 100 / (32 / eepromBuffer.motor_poles);
-        high_rpm_level = motor_kv / 12 / (32 / eepromBuffer.motor_poles);				
+        high_rpm_level = motor_kv / 12 / (32 / eepromBuffer.motor_poles);
     }
+#ifdef NUCLEO_L432KC_L431
+    low_rpm_throttle_limit = 0; // 開發板無過流風險，停用低轉速油門上限（否則 duty 鎖在 400 無法超過 k_erpm=11 門檻）
+#endif
     reverse_speed_threshold = map(motor_kv, 300, 3000, 1000, 500);
     if (eepromBuffer.bi_direction){
       polling_mode_changeover = POLLING_MODE_THRESHOLD / 2;
@@ -926,6 +937,17 @@ void PeriodElapsedCallback()
 	  advance = (commutation_interval * auto_advance_level) >> 6; // 60 divde 64 0.9375 degree increments
     }
     waitTime = (commutation_interval >> 1) - advance;
+    // 同步更新診斷快照（所有欄位來自同一 cycle）
+    dbg_snap.comm_interval  = commutation_interval;
+    dbg_snap.advance        = advance;
+    dbg_snap.waitTime       = waitTime;
+    dbg_snap.filter_level   = filter_level;
+    dbg_snap.zero_crosses   = zero_crosses;
+    dbg_snap.duty_cycle     = duty_cycle;
+    dbg_snap.adjusted_duty  = adjusted_duty_cycle;
+    dbg_snap.input          = input;
+    dbg_snap.old_routine    = old_routine;
+    dbg_snap.bemf_timeout   = bemf_timeout_happened;
     if (!old_routine) {
         enableCompInterrupts(); // enable comp interrupt
     }
@@ -1524,6 +1546,18 @@ void tenKhzRoutine()
         last_duty_cycle = duty_cycle;
         SET_AUTO_RELOAD_PWM(tim1_arr);
         SET_DUTY_CYCLE_ALL(adjusted_duty_cycle);
+#ifdef USE_COMP1_BLANKING
+        {   // 動態更新 TIM1 CH5 CCR5：遮蔽視窗 = duty cycle + 振鈴 margin
+            // 若 blanking 視窗侵蝕 BEMF 偵測視窗（不足 COMP_MIN_BEMF_WINDOW ticks），停用 blanking
+            uint32_t blanking_ccr = (uint32_t)adjusted_duty_cycle + COMP_BLANKING_MARGIN;
+            if (blanking_ccr + COMP_MIN_BEMF_WINDOW >= (uint32_t)tim1_arr) {
+                // 高 duty：clamp CCR5 保留最小 BEMF 視窗，避免 CCR5=0 造成完全無過濾
+                TIM1->CCR5 = (uint16_t)((uint32_t)tim1_arr - COMP_MIN_BEMF_WINDOW);
+            } else {
+                TIM1->CCR5 = (uint16_t)blanking_ccr;
+            }
+        }
+#endif
     }
 #endif // ndef brushed_mode
 #if defined(FIXED_DUTY_MODE) || defined(FIXED_SPEED_MODE)
@@ -1750,11 +1784,12 @@ int main(void)
     *(volatile uint32_t*)0xE0001000 |= 1u;          // DWT CTRL: CYCCNTENA
     loadEEpromSettings();
 
-    if (VERSION_MAJOR != eepromBuffer.version.major || VERSION_MINOR != eepromBuffer.version.minor || EEPROM_VERSION > eepromBuffer.eeprom_version) {
+    if (VERSION_MAJOR != eepromBuffer.version.major || VERSION_MINOR != eepromBuffer.version.minor
+        || EEPROM_VERSION > eepromBuffer.eeprom_version || eeprom_needs_save) {
         eepromBuffer.version.major = VERSION_MAJOR;
         eepromBuffer.version.minor = VERSION_MINOR;
         eepromBuffer.eeprom_version = EEPROM_VERSION;
-        saveEEpromSettings();
+        saveEEpromSettings(); // 版本更新 或 EEPROM 含非法值 → 寫回 Flash
     }
     
     if (eepromBuffer.dir_reversed == 1) {
@@ -1881,6 +1916,7 @@ int main(void)
 
     while (1) {
 e_com_time = ((commutation_intervals[0] + commutation_intervals[1] + commutation_intervals[2] + commutation_intervals[3] + commutation_intervals[4] + commutation_intervals[5]) + 4) >> 1; // COMMUTATION INTERVAL IS 0.5US INCREMENTS
+
 #if defined(FIXED_DUTY_MODE) || defined(FIXED_SPEED_MODE)
         setInput();
 #endif
@@ -2151,11 +2187,7 @@ if(zero_crosses < 5){
               duty_cycle_maximum = map(degrees_celsius, eepromBuffer.limits.temperature - 10, eepromBuffer.limits.temperature + 10,
                 throttle_max_at_high_rpm / 2, 1);
             }
-            if (zero_crosses < 100 && commutation_interval > 500) {
-              filter_level = 12;
-            } else {
-              filter_level = map(average_interval, 100, 500, 3, 12);
-            }
+            filter_level = 20;
             if (commutation_interval < 50) {
               filter_level = 2;
             }
