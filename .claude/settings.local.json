@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "Skill(keybindings-help)",
-      "Skill(keybindings-help:*)"
+      "Skill(keybindings-help:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(mkdir -p ~/.nano-banana)",
+      "Bash(~/.nano-banana/.env)",
+      "Bash(bun --version)",
+      "Bash(powershell -c \"irm bun.sh/install.ps1 | iex\")",
+      "Bash(/dev/null grep:*)",
+      "Bash(head -20 grep -n \"RELOAD_WATCHDOG_COUNTER\\\\|MX_IWDG_Init\" d:/Work_202506/DroneESC/AM32-main/Src/main.c)",
+      "Bash(grep -n tune[ d:/Work_202506/DroneESC/AM32-main/Inc/eeprom.h)",
+      "Bash(head -10 grep -n \"RCC->CSR\\\\|IWDGRST\" d:/Work_202506/DroneESC/AM32-main/Mcu/l431/Src/peripherals.c)"
     ]
   }
 }

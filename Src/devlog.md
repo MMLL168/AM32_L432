@@ -2,6 +2,34 @@
 
 ---
 
+## 2026-03-23
+
+### 修改原因
+`build_debug.ps1` 產生的 hex 從 `0x08000000` 開始（使用 `ldscript_debug.ld`），若誤上傳至 AM32 Configurator 會包含 bootloader 區，導致刷機失敗或覆蓋 bootloader。
+
+### 解決方式
+- `build_debug.ps1`：加入警告訊息，提醒此 hex 僅供 ST-Link 直接燒錄，不可透過 AM32 bootloader 刷入
+- 新增 `build_release.ps1`：呼叫 `make` 使用正式 `ldscript.ld`（`0x08001000` 起），產出可透過 AM32 Configurator 刷入的 hex
+
+---
+
+## 2026-03-22（日）
+
+### 修改原因
+準備正式 release，清理開發板專用 workaround 並更新 Firmware 識別名稱。
+
+### 解決方式
+- `Inc/targets.h`：`FIRMWARE_NAME` 由 `"L432KC"` 改為 `"MyESC v1.0"`
+- `Src/main.c`：移除 `#ifdef NUCLEO_L432KC_L431 / low_rpm_throttle_limit = 0` 開發板 hack（正式板有過流保護，需正常啟用低轉速油門限制）
+
+### Flash 佈局確認（Bootloader + App）
+確認 `Mcu/l431/ldscript.ld` App 起始位址已正確設定，無需修改：
+- `0x08000000`：AM32 Bootloader（4KB）
+- `0x08001000`：Application 起始（57KB）← 已正確
+- `0x0800F800`：EEPROM（2KB）
+
+---
+
 ## 2026-03-20（二）
 
 ### 修改原因

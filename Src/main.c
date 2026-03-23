@@ -818,9 +818,6 @@ void loadEEpromSettings()
         low_rpm_level = motor_kv / 100 / (32 / eepromBuffer.motor_poles);
         high_rpm_level = motor_kv / 12 / (32 / eepromBuffer.motor_poles);
     }
-#ifdef NUCLEO_L432KC_L431
-    low_rpm_throttle_limit = 0; // 開發板無過流風險，停用低轉速油門上限（否則 duty 鎖在 400 無法超過 k_erpm=11 門檻）
-#endif
     reverse_speed_threshold = map(motor_kv, 300, 3000, 1000, 500);
     if (eepromBuffer.bi_direction){
       polling_mode_changeover = POLLING_MODE_THRESHOLD / 2;

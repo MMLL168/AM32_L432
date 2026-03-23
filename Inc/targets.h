@@ -307,7 +307,7 @@
 
 #ifdef  NUCLEO_L432KC_L431
 #define FILE_NAME               "NUCLEO_L432KC_L431"
-#define FIRMWARE_NAME           "L432KC"
+#define FIRMWARE_NAME           "MyESC v1.0"
 #define DEAD_TIME               80
 #define HARDWARE_GROUP_L4_A
 //#define COMP_ORDER_L4_A_540
@@ -322,6 +322,7 @@
 //#define COMP_BLANKING_MARGIN    200
 //#define COMP_MIN_BEMF_WINDOW    100
 #define NOMINAL_PWM             24000U  // 24kHz：ARR=3332，OFF窗口7.5μs（82%duty），振鈴沉澱後5.5μs乾淨BEMF
+#define USE_CUSTOM_LED                  // NUCLEO PB3 板載 LED
 #endif
 
 #ifdef SEQURE_4IN1_E230
